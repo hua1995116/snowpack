@@ -9,6 +9,8 @@ import yargs from 'yargs-parser';
 import babelPresetEnv from '@babel/preset-env';
 import isNodeBuiltin from 'is-builtin-module';
 import validatePackageName from 'validate-npm-package-name';
+import got from 'got';
+import PQueue from 'p-queue';
 
 import * as rollup from 'rollup';
 import rollupPluginNodeResolve from '@rollup/plugin-node-resolve';
@@ -26,6 +28,10 @@ import {
 } from './rollup-plugin-dependency-info.js';
 import {scanImports, scanDepList, InstallTarget} from './scan-imports.js';
 import {resolveDependencyManifest} from './util.js';
+
+export interface ImportMap {
+  imports: {[key: string]: string};
+}
 
 export interface DependencyLoc {
   type: 'JS' | 'ASSET';
@@ -117,6 +123,29 @@ function formatDependencyStats(): string {
     output += `\n${formatFiles(allCommon, 'web_modules/common/ (Shared)')}`;
   }
   return `\n${output}\n`;
+}
+
+/**
+ * Parse a "Link" header for multiple link URLs.
+ */
+function parseLinkHeader(header) {
+  if (!header || header.length === 0) {
+    return [];
+  }
+  // Split parts by comma
+  var parts = header.split(', ');
+  var links = [];
+  // Parse each part into a named link
+  for (var i = 0; i < parts.length; i++) {
+    var section = parts[i].split(';');
+    if (section.length !== 2) {
+      throw new Error("section could not be split on ';'");
+    }
+    var url = section[0].replace(/<(.*)>/, '$1').trim();
+    var name = section[1].replace(/rel="(.*)"/, '$1').trim();
+    links.push(url);
+  }
+  return links;
 }
 
 function logError(msg) {
@@ -251,6 +280,7 @@ export async function install(
     logError('no "node_modules" directory exists. Did you run "npm install" first?');
     return;
   }
+
   const allInstallSpecifiers = new Set(installTargets.map(dep => dep.specifier));
   const depObject: {[targetName: string]: string} = {};
   const assetObject: {[targetName: string]: string} = {};
@@ -287,6 +317,7 @@ export async function install(
       return false;
     }
   }
+
   if (Object.keys(depObject).length === 0 && Object.keys(assetObject).length === 0) {
     logError(`No ESM dependencies found!`);
     console.log(
@@ -381,6 +412,7 @@ export async function install(
     exports: 'named' as 'named',
     chunkFileNames: 'common/[name]-[hash].js',
   };
+
   if (Object.keys(depObject).length > 0) {
     const packageBundle = await rollup.rollup(inputOptions);
     await packageBundle.write(outputOptions);
@@ -440,6 +472,100 @@ export async function install(
   return true;
 }
 
+export async function installRemote(
+  installTargets: InstallTarget[],
+  {isExplicit}: InstallOptions,
+  config: SnowpackConfig,
+) {
+  const {
+    installOptions: {dest: destLoc, nomodule, optimize: isOptimized},
+  } = config;
+  const downloadQueue = new PQueue({concurrency: 20});
+  const allInstallSpecifiers = new Set(installTargets.map(dep => dep.specifier));
+  const importMapLocal = {};
+  const importMapRemote = {};
+  const skipFailures = !isExplicit;
+
+  async function handleInstallSpecifier(installSpecifier: string, isTopLevel?: boolean) {
+    try {
+      const installLoc = path.join(destLoc, installSpecifier);
+      const installFileName = getWebDependencyName(installLoc) + '.js';
+      let distData = `${isOptimized && isTopLevel ? '/minified,bundled' : ''}`;
+      console.log(`https://pika-cdn.fkschott.now.sh/${installSpecifier}${distData}`);
+      const response = await got(
+        `https://pika-cdn.fkschott.now.sh/${installSpecifier}${distData}`,
+        {
+          headers: {
+            'user-agent': `snowpack/v1 (https://snowpack.dev)`,
+          },
+        },
+      );
+      const importUrl = response.headers['x-import-url'] as string;
+      const pinnedUrl = response.headers['x-pinned-url'] as string;
+      const linkUrls = parseLinkHeader(response.headers['link']);
+      if (isTopLevel) {
+        if (!importUrl) {
+          throw new Error('X-Import-URL Header expected, but none received.');
+        }
+        if (!pinnedUrl) {
+          throw new Error('X-Pinned-URL Header expected, but none received.');
+        }
+        importMapLocal[installSpecifier] = `.${getWebDependencyName(importUrl) + '.js'}`;
+        importMapRemote[
+          installSpecifier
+        ] = `https://pika-cdn.fkschott.now.sh${pinnedUrl}minified,bundled`;
+      }
+      await mkdirp.sync(path.dirname(installLoc));
+      const code = response.body.replace(/from '\/\-\//gm, `from '\/web_modules\/-\/`);
+      await fs.writeFileSync(installFileName, code, {encoding: 'utf8'});
+      linkUrls.forEach(url => {
+        const cleanUrl = url.substr(1);
+        if (!allInstallSpecifiers.has(cleanUrl)) {
+          allInstallSpecifiers.add(cleanUrl);
+          downloadQueue.add(() => handleInstallSpecifier(cleanUrl));
+        }
+      });
+      if (isTopLevel) {
+        installResults.push([installSpecifier, true]);
+      }
+      spinner.text = banner + formatInstallResults(skipFailures);
+    } catch (err) {
+      console.log(err);
+      installResults.push([installSpecifier, false]);
+      spinner.text = banner + formatInstallResults(skipFailures);
+      if (skipFailures) {
+        return false;
+      }
+      // An error occurred! Log it.
+      logError(err.message || err);
+      if (err.hint) {
+        console.log(err.hint);
+      }
+      return false;
+    }
+  }
+
+  for (const installSpecifier of allInstallSpecifiers) {
+    downloadQueue.add(() => handleInstallSpecifier(installSpecifier, true));
+  }
+
+  await downloadQueue.onIdle();
+  if (nomodule) {
+    spinner.warn(`${chalk.bold('snowpack')} doesn't yet support --nomodule with the pika CDN.`);
+  }
+  fs.writeFileSync(
+    path.join(destLoc, 'import-map.local.json'),
+    JSON.stringify({imports: importMapLocal}, undefined, 2),
+    {encoding: 'utf8'},
+  );
+  fs.writeFileSync(
+    path.join(destLoc, 'import-map.remote.json'),
+    JSON.stringify({imports: importMapRemote}, undefined, 2),
+    {encoding: 'utf8'},
+  );
+  return true;
+}
+
 export async function cli(args: string[]) {
   // parse CLI flags
   const cliFlags = yargs(args, {array: ['exclude', 'externalPackage']});
@@ -454,6 +580,7 @@ export async function cli(args: string[]) {
   const {config, errors} = loadConfig({
     installOptions: cliFlags as SnowpackConfig['installOptions'],
   });
+  config.source = cliFlags.source || config.source;
 
   // handle config errors (if any)
   if (Array.isArray(errors) && errors.length) {
@@ -464,6 +591,7 @@ export async function cli(args: string[]) {
   const {
     installOptions: {clean, dest, exclude, include},
     webDependencies,
+    source,
   } = config;
 
   let pkgManifest: any;
@@ -508,7 +636,16 @@ export async function cli(args: string[]) {
 
   spinner.start();
   const startTime = Date.now();
-  const result = await install(installTargets, {hasBrowserlistConfig, isExplicit}, config);
+  let result: any;
+  if (source === 'node') {
+    result = await install(installTargets, {hasBrowserlistConfig, isExplicit}, config);
+  } else if (source === 'pika') {
+    result = await installRemote(installTargets, {hasBrowserlistConfig, isExplicit}, config);
+  } else {
+    spinner.warn(chalk(`--source: expected "pika", "node" but got "${source}".`));
+    process.exitCode = 1;
+    return;
+  }
 
   if (result) {
     spinner.succeed(

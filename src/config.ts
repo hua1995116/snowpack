@@ -6,6 +6,7 @@ import merge from 'deepmerge';
 // default settings
 const DEFAULT_CONFIG: SnowpackConfig = {
   dedupe: [],
+  source: 'node',
   installOptions: {
     clean: false,
     dest: 'web_modules',
@@ -21,6 +22,7 @@ const DEFAULT_CONFIG: SnowpackConfig = {
 // interface this library uses internally
 export interface SnowpackConfig {
   dedupe?: string[];
+  source?: string,
   namedExports?: {[filepath: string]: string[]};
   installOptions: {
     babel?: boolean;
@@ -44,6 +46,7 @@ export interface SnowpackConfig {
 const configSchema = {
   type: 'object',
   properties: {
+    source: {type: 'string'},
     dedupe: {
       type: 'array',
       items: {type: 'string'},
